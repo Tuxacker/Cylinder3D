@@ -2,11 +2,14 @@
 # author: Xinge
 # @file: pc_dataset.py 
 
+from glob import glob
 import os
 import numpy as np
 from torch.utils import data
 import yaml
 import pickle
+
+import open3d as o3d
 
 REGISTERED_PC_DATASET_CLASSES = {}
 
@@ -58,6 +61,80 @@ class SemKITTI_demo(data.Dataset):
         data_tuple = (raw_data[:, :3], annotated_data.astype(np.uint8))
         if self.return_ref:
             data_tuple += (raw_data[:, 3],)
+        return data_tuple
+
+@register_dataset
+class Custom_demo(data.Dataset):
+    def __init__(self, file, return_ref=True, label_mapping="semantic-kitti.yaml", demo_label_path=None):
+        with open(label_mapping, 'r') as stream:
+            semkittiyaml = yaml.safe_load(stream)
+        self.learning_map = semkittiyaml['learning_map']
+        self.return_ref = return_ref
+
+        with open(file, "rb") as f:
+            self.raw_data = pickle.load(f)
+
+        def chunk_preparation(chunk, scans_per_round, max_dist):
+            timestamps = np.array(sorted(list(chunk.keys())))
+            scans = np.array_split(timestamps, len(timestamps) // scans_per_round)
+            grouped_scans = []
+            source_adma = []
+
+            def filter_by_dist(scan_in, max_dist=None):
+                if max_dist is None:
+                    return scan_in[0]
+                else:
+                    mask = np.linalg.norm(scan_in[0] - scan_in[1], axis=1) < max_dist
+                    return scan_in[0][mask]
+
+            for scan_timestamps in scans:
+                source_pcl = np.concatenate([filter_by_dist(chunk[t], max_dist) - chunk[t][1] for t in scan_timestamps if chunk[t][0].ndim == 2], axis=0)
+                grouped_scans.append(source_pcl)
+            return grouped_scans
+
+        combined_scans = chunk_preparation(self.raw_data, 75, 50) 
+
+        self.raw_data = combined_scans
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.raw_data)
+
+    def __getitem__(self, index):
+        raw_data = self.raw_data[index]
+
+        annotated_data = np.expand_dims(np.zeros_like(raw_data[:, 0], dtype=int), axis=1)
+
+        data_tuple = (raw_data[:, :3], annotated_data.astype(np.uint8))
+        if self.return_ref:
+            data_tuple += (annotated_data,)
+        return data_tuple
+
+@register_dataset
+class Custom_KITTI(data.Dataset):
+    def __init__(self, file, return_ref=True, label_mapping="semantic-kitti.yaml", demo_label_path=None):
+        with open(label_mapping, 'r') as stream:
+            semkittiyaml = yaml.safe_load(stream)
+        self.learning_map = semkittiyaml['learning_map']
+        self.return_ref = return_ref
+
+        self.folder = sorted(glob(f"{file}/*"))[:2000]
+
+    def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.folder)
+
+    def __getitem__(self, index):
+        file_name = self.folder[index]
+
+        raw_data = np.fromfile(file_name, dtype=np.float32)
+        raw_data = raw_data.reshape((-1, 4))[:, :3]
+
+        annotated_data = np.expand_dims(np.zeros_like(raw_data[:, 0], dtype=int), axis=1)
+
+        data_tuple = (raw_data[:, :3], annotated_data.astype(np.uint8))
+        if self.return_ref:
+            data_tuple += (annotated_data,)
         return data_tuple
 
 @register_dataset

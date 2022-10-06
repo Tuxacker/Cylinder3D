@@ -5,8 +5,10 @@
 import os
 import time
 import argparse
+from glob import glob
 import sys
 import numpy as np
+import pickle
 import torch
 import torch.optim as optim
 from tqdm import tqdm
@@ -25,31 +27,44 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+def get_latest_data_names(base_dir, prefix, suffix=".pkl"):
+    data_files = sorted(list(glob(base_dir + "/" + prefix + "_*" + suffix)))
+    last_timestamp = sorted(list(set([f.split(prefix)[1].split("_")[1] for f in data_files])))[-1]
+    return [f for f in data_files if last_timestamp in f]
+
+INFER_KITTI = True
 
 def build_dataset(dataset_config,
-                  data_dir,
-                  grid_size=[480, 360, 32],
-                  demo_label_dir=None):
+                  data,
+                  grid_size=[480, 360, 32]):
 
-    if demo_label_dir == '':
-        imageset = "demo"
-    else:
-        imageset = "val"
     label_mapping = dataset_config["label_mapping"]
 
-    SemKITTI_demo = get_pc_model_class('SemKITTI_demo')
+    if INFER_KITTI:
+        SemKITTI_demo = get_pc_model_class('Custom_KITTI')
+    else:
+        SemKITTI_demo = get_pc_model_class('Custom_demo')
 
-    demo_pt_dataset = SemKITTI_demo(data_dir, imageset=imageset,
-                              return_ref=True, label_mapping=label_mapping, demo_label_path=demo_label_dir)
+    demo_pt_dataset = SemKITTI_demo(data, return_ref=True, label_mapping=label_mapping)
 
-    demo_dataset = get_model_class(dataset_config['dataset_type'])(
-        demo_pt_dataset,
-        grid_size=grid_size,
-        fixed_volume_space=dataset_config['fixed_volume_space'],
-        max_volume_space=dataset_config['max_volume_space'],
-        min_volume_space=dataset_config['min_volume_space'],
-        ignore_label=dataset_config["ignore_label"],
-    )
+    if INFER_KITTI:
+        demo_dataset = get_model_class(dataset_config['dataset_type'])(
+            demo_pt_dataset,
+            grid_size=grid_size,
+            fixed_volume_space=dataset_config['fixed_volume_space'],
+            max_volume_space=dataset_config['max_volume_space'],
+            min_volume_space=dataset_config['min_volume_space'],
+            ignore_label=dataset_config["ignore_label"],
+        )
+    else:
+        demo_dataset = get_model_class(dataset_config['dataset_type'])(
+            demo_pt_dataset,
+            grid_size=grid_size,
+            fixed_volume_space=False,#dataset_config['fixed_volume_space'],
+            max_volume_space=dataset_config['max_volume_space'],
+            min_volume_space=dataset_config['min_volume_space'],
+            ignore_label=dataset_config["ignore_label"],
+        )
     demo_dataset_loader = torch.utils.data.DataLoader(dataset=demo_dataset,
                                                      batch_size=1,
                                                      collate_fn=collate_fn_BEV,
@@ -58,13 +73,11 @@ def build_dataset(dataset_config,
 
     return demo_dataset_loader
 
-def main(args):
+def main(args, data_dir):
     pytorch_device = torch.device('cuda:0')
     config_path = args.config_path
     configs = load_config_data(config_path)
     dataset_config = configs['dataset_params']
-    data_dir = args.demo_folder
-    demo_label_dir = args.demo_label_folder
     save_dir = args.save_folder + "/"
 
     demo_batch_size = 1
@@ -85,67 +98,61 @@ def main(args):
         my_model = load_checkpoint(model_load_path, my_model)
 
     my_model.to(pytorch_device)
-    optimizer = optim.Adam(my_model.parameters(), lr=train_hypers["learning_rate"])
 
-    loss_func, lovasz_softmax = loss_builder.build(wce=True, lovasz=True,
-                                                   num_class=num_class, ignore_label=ignore_label)
-
-    demo_dataset_loader = build_dataset(dataset_config, data_dir, grid_size=grid_size, demo_label_dir=demo_label_dir)
+    demo_dataset_loader = build_dataset(dataset_config, data_dir, grid_size=grid_size)
     with open(dataset_config["label_mapping"], 'r') as stream:
         semkittiyaml = yaml.safe_load(stream)
     inv_learning_map = semkittiyaml['learning_map_inv']
 
+    print(f"Dataset length: {len(demo_dataset_loader)}")
+
+    label_list = []
+
     my_model.eval()
-    hist_list = []
-    demo_loss_list = []
     with torch.no_grad():
         for i_iter_demo, (_, demo_vox_label, demo_grid, demo_pt_labs, demo_pt_fea) in enumerate(
                 demo_dataset_loader):
+
+            # print(i_iter_demo)
             demo_pt_fea_ten = [torch.from_numpy(i).type(torch.FloatTensor).to(pytorch_device) for i in
                               demo_pt_fea]
             demo_grid_ten = [torch.from_numpy(i).to(pytorch_device) for i in demo_grid]
             demo_label_tensor = demo_vox_label.type(torch.LongTensor).to(pytorch_device)
 
             predict_labels = my_model(demo_pt_fea_ten, demo_grid_ten, demo_batch_size)
-            loss = lovasz_softmax(torch.nn.functional.softmax(predict_labels).detach(), demo_label_tensor,
-                                  ignore=0) + loss_func(predict_labels.detach(), demo_label_tensor)
+
             predict_labels = torch.argmax(predict_labels, dim=1)
             predict_labels = predict_labels.cpu().detach().numpy()
             for count, i_demo_grid in enumerate(demo_grid):
-                hist_list.append(fast_hist_crop(predict_labels[
-                                                    count, demo_grid[count][:, 0], demo_grid[count][:, 1],
-                                                    demo_grid[count][:, 2]], demo_pt_labs[count],
-                                                unique_label))
                 inv_labels = np.vectorize(inv_learning_map.__getitem__)(predict_labels[count, demo_grid[count][:, 0], demo_grid[count][:, 1], demo_grid[count][:, 2]]) 
-                inv_labels = inv_labels.astype('uint32')
-                outputPath = save_dir + str(i_iter_demo).zfill(6) + '.label'
-                inv_labels.tofile(outputPath)
-                print("save " + outputPath)
-            demo_loss_list.append(loss.detach().cpu().numpy())
+                inv_labels = inv_labels.astype('uint32') & 0xFFFF
+                # print(predict_labels.shape)
+                # print(inv_labels.shape)
+                if INFER_KITTI:
+                    np.save(f"{save_dir}{i_iter_demo:06d}.label", inv_labels)
+                else:
+                    label_list.append(inv_labels)
 
-    if demo_label_dir != '':
-        my_model.train()
-        iou = per_class_iu(sum(hist_list))
-        print('Validation per class iou: ')
-        for class_name, class_iou in zip(unique_label_str, iou):
-            print('%s : %.2f%%' % (class_name, class_iou * 100))
-        val_miou = np.nanmean(iou) * 100
-        del demo_vox_label, demo_grid, demo_pt_fea, demo_grid_ten
-
-        print('Current val miou is %.3f' %
-              (val_miou))
-        print('Current val loss is %.3f' %
-              (np.mean(demo_loss_list)))
+    if not INFER_KITTI:
+        with open(data_dir.replace("raw", "labels"), "wb") as f:
+            pickle.dump(label_list, f)
+  
 
 if __name__ == '__main__':
     # Training settings
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('-y', '--config_path', default='config/semantickitti.yaml')
     parser.add_argument('--demo-folder', type=str, default='', help='path to the folder containing demo lidar scans', required=True)
-    parser.add_argument('--save-folder', type=str, default='', help='path to save your result', required=True)
-    parser.add_argument('--demo-label-folder', type=str, default='', help='path to the folder containing demo labels')
+    parser.add_argument('--save-folder', type=str, default='', help='path to save your result')
     args = parser.parse_args()
+    
+    if INFER_KITTI:
+        main(args, args.demo_folder)
+    else:
+        chunk_files = get_latest_data_names(args.demo_folder, "raw_chunk")
 
-    print(' '.join(sys.argv))
-    print(args)
-    main(args)
+        for file in chunk_files:
+            print(f"Processing {file}")
+            # print(' '.join(sys.argv))
+            # print(args)
+            main(args, file)
